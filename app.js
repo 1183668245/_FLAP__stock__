@@ -163,6 +163,7 @@
   const RANK_WEIGHTS = [0, 0, 100, 110, 120, 140, 160, 200];
   const RANK_WEIGHT_BPS = [0, 0, 10000, 11000, 12000, 14000, 16000, 20000];
   const MIN_HOLDING_TOKEN = 5_000_000n * 10n ** 18n;
+  const MIN_HOLDING_QUALIFY_DELAY = 2n * 60n * 60n;
   const HEAT_PER_BNB = 1_000_000n;
   const WEI = 10n ** 18n;
   function getLegionName(legionId) { return LEGION_NAMES[Number(legionId)] || "未加入"; }
@@ -172,7 +173,7 @@
   function heatFromBnbWei(valueWei) { return (BigInt(valueWei || 0) * HEAT_PER_BNB) / WEI; }
 
   const vaultAbi = [
-    "function description() view returns (string)","function currentSeasonId() view returns (uint256)","function seasonTimeRange(uint256) view returns (uint64,uint64,uint64)","function isLockPeriod(uint256) view returns (bool)","function stockKingTreasury() view returns (uint256)","function legions(uint8) view returns (address leader,uint64,uint64,uint256 totalHistoricalContribution,uint256 totalTreasuryWon,uint32 totalWinCount,uint32 totalTop3Count)","function seasonLegions(uint256,uint8) view returns (uint256 heat,uint256 qualifiedWeight,uint32 validContributorCount,uint64,bool,address,bool,bool,bool,uint256,uint256,uint256,uint256)","function users(address) view returns (uint8 currentLegion,uint8 rank,uint64 lastLegionChangeTime)","function userLegionHistoricalContribution(address,uint8) view returns (uint256)","function userSeasonLegion(uint256,address,uint8) view returns (uint256 rawContribution,uint256 weightedContribution,uint256 qualifiedRawContribution,uint256 qualifiedWeightedContribution,bool claimed,bool leaderClaimed)","function upgradeFees(uint256) view returns (uint256)","function joinLegion(uint8)","function contribute(uint8) payable","function upgradeRank(uint8) payable","function switchLegionWithContribution(uint8) payable","function challengeLeader(uint8)","function settleSeason(uint256)","function claimPreview(address,uint256,uint8) view returns (uint256 claimable,uint256 memberAmount,uint256 leaderAmount,bool expired,bool meetsHoldingNow,bool alreadyClaimed)","function claim(uint256,uint8)"
+    "function description() view returns (string)","function currentSeasonId() view returns (uint256)","function seasonTimeRange(uint256) view returns (uint64,uint64,uint64)","function isLockPeriod(uint256) view returns (bool)","function stockKingTreasury() view returns (uint256)","function legions(uint8) view returns (address leader,uint64,uint64,uint256 totalHistoricalContribution,uint256 totalTreasuryWon,uint32 totalWinCount,uint32 totalTop3Count)","function seasonLegions(uint256,uint8) view returns (uint256 heat,uint256 qualifiedWeight,uint32 validContributorCount,uint64,bool,address,bool,bool,bool,uint256,uint256,uint256,uint256)","function seasons(uint256) view returns (uint64 startTime,uint64 endTime,uint64 lockTime,uint64 settledTime,uint64 claimDeadline,uint32 dailyCycleId,bool settled,uint8 rankedCount,uint8[3] rankedLegions,uint256 treasuryBeforeRelease,uint256 releasedAmount,uint256 rolledAmount)","function users(address) view returns (uint8 currentLegion,uint8 rank,uint64 lastLegionChangeTime)","function userLegionHistoricalContribution(address,uint8) view returns (uint256)","function userSeasonLegion(uint256,address,uint8) view returns (uint256 rawContribution,uint256 weightedContribution,uint256 qualifiedRawContribution,uint256 qualifiedWeightedContribution,bool claimed,bool leaderClaimed)","function holdingQualifiedSince(address) view returns (uint64)","function upgradeFees(uint256) view returns (uint256)","function joinLegion(uint8)","function contribute(uint8) payable","function upgradeRank(uint8) payable","function switchLegionWithContribution(uint8) payable","function challengeLeader(uint8)","function settleSeason(uint256)","function claim(uint256,uint8)"
   ];
 
   const tokenAbi = [
@@ -974,13 +975,29 @@
   async function previewReward() {
     try {
       if (!state.userAddress) await connectWallet();
-      if (!state.readVault) throw new Error("合约未初始化，请先刷新或重新连接钱包");
+      if (!state.readVault || !state.readToken) throw new Error("合约未初始化，请先刷新或重新连接钱包");
       const ui = getActiveRewardUi();
       const sid = Number(ui.seasonEl?.value);
       const lid = Number(ui.legionEl?.value);
       if (!sid || lid < 1 || lid > 5) return showToast("请输入有效的赛季和军团", "error");
       if (ui.resultEl) ui.resultEl.textContent = `查询中…（赛季 ${sid} / 军团 ${lid}）`;
-      state.rewardPreview = await state.readVault.claimPreview(state.userAddress, sid, lid);
+      const [seasonUser, seasonLegion, seasonState, qualifiedSince, balance] = await Promise.all([
+        state.readVault.userSeasonLegion(sid, state.userAddress, lid),
+        state.readVault.seasonLegions(sid, lid),
+        state.readVault.seasons(sid),
+        state.readVault.holdingQualifiedSince(state.userAddress),
+        state.readToken.balanceOf(state.userAddress)
+      ]);
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      const meetsHoldingNow = balance >= MIN_HOLDING_TOKEN && BigInt(qualifiedSince || 0) > 0n && now >= BigInt(qualifiedSince) + MIN_HOLDING_QUALIFY_DELAY;
+      const memberAmount = !seasonUser.claimed && seasonUser.qualifiedWeightedContribution > 0n && seasonLegion.qualifiedWeight > 0n
+        ? (seasonLegion.memberRewardPool * seasonUser.qualifiedWeightedContribution) / seasonLegion.qualifiedWeight
+        : 0n;
+      const isLeader = Boolean(seasonLegion.leaderEligible && seasonLegion.leaderAtLock && String(seasonLegion.leaderAtLock).toLowerCase() === state.userAddress.toLowerCase());
+      const leaderAmount = !seasonUser.leaderClaimed && isLeader ? seasonLegion.leaderRewardAmount : 0n;
+      const expired = Boolean(seasonState.settled && BigInt(seasonState.claimDeadline || 0) > 0n && now > BigInt(seasonState.claimDeadline));
+      const claimable = seasonState.settled && !expired && meetsHoldingNow ? memberAmount + leaderAmount : 0n;
+      state.rewardPreview = { claimable, memberAmount, leaderAmount, expired, meetsHoldingNow, alreadyClaimed: claimable === 0n && Boolean(seasonUser.claimed || seasonUser.leaderClaimed), settled: Boolean(seasonState.settled) };
       renderRewardResult(sid, lid);
     } catch (error) {
       const msg = parseError(error);
@@ -996,31 +1013,14 @@
     if (!target) return;
     const p = state.rewardPreview;
     if (!p) return;
-
     const claimable = Number(ethers.formatEther(p.claimable)).toFixed(4);
     const memberAmount = Number(ethers.formatEther(p.memberAmount)).toFixed(4);
     const leaderAmount = Number(ethers.formatEther(p.leaderAmount)).toFixed(4);
-
-    if (p.expired) {
-      target.textContent = `赛季 ${sid} / 军团 ${lid}：该奖励已过期（30 天窗口已结束）。`;
-      return;
-    }
-
-    if (p.alreadyClaimed) {
-      target.textContent = `赛季 ${sid} / 军团 ${lid}：已领取。`;
-      return;
-    }
-
-    if (!p.meetsHoldingNow) {
-      target.textContent = `赛季 ${sid} / 军团 ${lid}：当前持仓不足，暂不可领取。`;
-      return;
-    }
-
-    if (p.claimable === 0n) {
-      target.textContent = `赛季 ${sid} / 军团 ${lid}：暂不可领取（可能该赛季未结算，或你在该赛季该军团没有有效加权贡献）。可领取 ${claimable} BNB；成员 ${memberAmount}；军团长 ${leaderAmount}。`;
-      return;
-    }
-
+    if (!p.settled) return void (target.textContent = `赛季 ${sid} / 军团 ${lid}：该赛季还没结算，暂不可领取。`);
+    if (p.expired) return void (target.textContent = `赛季 ${sid} / 军团 ${lid}：该奖励已过期（30 天窗口已结束）。`);
+    if (p.alreadyClaimed) return void (target.textContent = `赛季 ${sid} / 军团 ${lid}：已领取。`);
+    if (!p.meetsHoldingNow) return void (target.textContent = `赛季 ${sid} / 军团 ${lid}：当前持仓不足，暂不可领取。`);
+    if (p.claimable === 0n) return void (target.textContent = `赛季 ${sid} / 军团 ${lid}：暂无可领取奖励。成员 ${memberAmount} BNB；军团长 ${leaderAmount} BNB。`);
     target.textContent = `赛季 ${sid} / 军团 ${lid}：可领取 ${claimable} BNB；成员 ${memberAmount}；军团长 ${leaderAmount}。`;
   }
 
